@@ -6,6 +6,7 @@ from typing import Any, TypeVar
 
 import datasets
 from loguru import logger
+import multiprocess
 
 from manaita.dataset_uri import DatasetUri
 from manaita.preprocessor import get_preprocessor, get_preprocessor_signature
@@ -87,7 +88,7 @@ def _preprocess_dataset(
             preproc_args, **taskdef["preprocessor_args_override"]
         )
 
-    ret = list(subdatasets)
+    ret: list[datasets.Dataset] = list(subdatasets)
     for preprocdef in taskdef["preprocessors"]:
         preproc = get_preprocessor(preprocdef)
         ret = [preproc(ds, preproc_args) for ds in ret]
@@ -218,7 +219,15 @@ def get_dataset(
             "get_dataset only supports map-style datasets; use get_iterable_dataset"
         )
 
-    processed = _preprocess_dataset(map_style_subdatasets, taskdef, normalized_args)
+    previous_start_method = multiprocess.get_start_method(allow_none=True)
+    try:
+        if normalized_args.multiprocess_start_method:
+            multiprocess.set_start_method(normalized_args.multiprocess_start_method)
+        processed = _preprocess_dataset(map_style_subdatasets, taskdef, normalized_args)
+    finally:
+        if previous_start_method is not None:
+            multiprocess.set_start_method(previous_start_method)
+
     ret = _concatenate_datasets(processed)
 
     should_shuffle = training if shuffle is None else shuffle

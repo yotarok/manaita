@@ -26,6 +26,7 @@ class PreProcessorArgs:
     training: bool | None = None
     filter_columns: Sequence[str] | None = None
     debug: bool = False
+    multiprocess_start_method: str | None = "spawn"
 
     @property
     def descriptor(self) -> dict[str, Any]:
