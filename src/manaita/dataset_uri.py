@@ -1,6 +1,7 @@
 import dataclasses
+import urllib.parse
 import warnings
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from typing import Any, Protocol
 
 import aiohttp
@@ -16,17 +17,27 @@ class DataSource(Protocol):
     ) -> datasets.Dataset | datasets.IterableDataset: ...
 
 
+def _extract_parameters(s: str) -> tuple[list[tuple[str, str]], str]:
+    s, param_str, *_ = s.split("?", maxsplit=1) + [""]
+    parameters = []
+    if param_str:
+        for kvpair in param_str.split("&"):
+            k, v = kvpair.split("=", maxsplit=1)
+            k = urllib.parse.unquote(k)
+            v = urllib.parse.unquote(v)
+            parameters.append((k, v))
+    return parameters, s
+
+
 @dataclasses.dataclass
 class DatasetUri:
     """Utility class for specifying a dataset from, e.g. command-line argument.
 
     A dataset URI has the following form.
+     - "hfhub:[NAME]:[SPLIT]?[PARAMETERS]"
+     - "parquet:gs://[GLOB]?[PARAMETERS]"
 
-     - full: "[SOURCE]:[NAME]:[SPLIT]?[PARAMTERS]"
-     - w/o source: "[NAME]:[SPLIT]"
-     - w/o split: "[NAME]"
-
-    [SOURCE] and [NAME] does not include ':' or '?', and [SPLIT] does not include '?'
+    where all components (NAME, SPLIT, GLOB, PARAMETERS) are URL-encoded.
     """
 
     source: str | None
@@ -45,34 +56,48 @@ class DatasetUri:
 
     @classmethod
     def from_string(cls, s: str) -> "DatasetUri":
-        param_str = ""
-        if "?" in s:
-            s, param_str = s.split("?", maxsplit=1)
-
-        components = s.split(":", maxsplit=2)
-
-        source = None
-        name = None
-        split = None
-        if len(components) == 3:
-            source, name, split = components
-        elif len(components) == 2:
-            name, split = components
-        elif len(components) == 1:
-            (name,) = components
+        source, rest = s.split(":", maxsplit=1)
+        if source == "hfhub":
+            return cls.from_string_hfhub(rest)
+        elif source == "parquet":
+            return cls.from_string_parquet(rest)
         else:
-            raise ValueError("`DatasetUri.from_string` is called with an empty string")
+            raise ValueError(f"Unknow data-source specified input={s} source={source}")
 
-        parameters = []
-        if param_str:
-            for kvpair in param_str.split("&"):
-                k, v = kvpair.split("=", maxsplit=1)
-                parameters.append((k, v))
-
+    @classmethod
+    def from_string_hfhub(cls, s: str) -> "DatasetUri":
+        parameters, s = _extract_parameters(s)
+        source = "hfhub"
+        name, split, *_ = s.split(":", maxsplit=1) + [None]
+        name = urllib.parse.unquote(name)
+        split = urllib.parse.unquote(split)
         return cls(source, name, split, parameters)
+
+    @classmethod
+    def from_string_parquet(cls, s: str) -> "DatasetUri":
+        parameters, name = _extract_parameters(s)
+        name = urllib.parse.unquote(name)
+        source = "parquet"
+        return cls(source, name, None, parameters)
 
 
 _HFHUB_LOAD_DATASET_OVERRIDABLE_PARAMETERS = {"revision", "data_dir"}
+
+
+def _extract_load_opts(parameters: dict[str, str]) -> dict[str, Any]:
+    load_opts = {}
+    to_be_removed = []
+    for k, v in parameters:
+        if k in _HFHUB_LOAD_DATASET_OVERRIDABLE_PARAMETERS:
+            load_opts[k] = v
+            to_be_removed.append(k)
+        else:
+            warnings.warn(f"Parameter {k} is specified in {uri}, but ignored.")
+
+    parameters = parameters.copy()
+    for k in to_be_removed:
+        parameters.pop(k)
+    return load_opts, parameters
 
 
 def load_dataset_from_hugging_face_hub(
@@ -80,13 +105,7 @@ def load_dataset_from_hugging_face_hub(
 ) -> datasets.Dataset | datasets.IterableDataset:
     hf_user_name, hf_dataset_name, hf_config_name = (uri.name.split("/") + [None])[:3]
 
-    load_opts = {}
-    for k, v in uri.parameters:
-        if k in _HFHUB_LOAD_DATASET_OVERRIDABLE_PARAMETERS:
-            load_opts[k] = v
-        else:
-            warnings.warn(f"Parameter {k} is specified in {uri}, but ignored.")
-
+    load_opts, _other_parameters = _extract_load_opts(dict(uri.parameters))
     logger.info(f"Loading dataset [{uri.name}:{uri.split}] from hfhub. ({load_opts=})")
     dataset = datasets.load_dataset(
         f"{hf_user_name}/{hf_dataset_name}",
@@ -104,9 +123,29 @@ def load_dataset_from_hugging_face_hub(
     return dataset
 
 
+def load_dataset_from_parquet_files(
+    uri: DatasetUri, streaming: bool = False, num_proc: int | None = None
+) -> datasets.Dataset | datasets.IterableDataset:
+    load_opts, _other_parameters = _extract_load_opts(dict(uri.parameters))
+    logger.info(f"Loading dataset parquet glob {uri.name}. ({load_opts=})")
+
+    dss = datasets.load_dataset(
+        "parquet",
+        data_files=uri.name,
+        split=uri.split,
+        num_proc=num_proc,
+        streaming=streaming,
+        **load_opts,
+    )
+    ds = dss[uri.split or "train"]
+    assert isinstance(ds, (datasets.Dataset, datasets.IterableDataset))
+    return ds
+
+
 _DATA_SOURCES: dict[str, DataSource] = {
     "": load_dataset_from_hugging_face_hub,
     "hfhub": load_dataset_from_hugging_face_hub,
+    "parquet": load_dataset_from_parquet_files,
 }
 
 
