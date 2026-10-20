@@ -1,6 +1,7 @@
 import json
 import pathlib
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, cast
 
 import cloudpathlib
@@ -16,12 +17,17 @@ def _save_sharded_parquet(
     *,
     num_shards: int,
     staging_path: cloudpathlib.CloudPath,
+    num_workers: int,
 ) -> None:
-    staging_path.mkdir(parents=True, exist_ok=True)
-    for i in range(num_shards):
-        ds.shard(num_shards=num_shards, index=i).to_parquet(
+    def _write_shard(i: int) -> None:
+        shard = ds.shard(num_shards=num_shards, index=i)
+        shard.to_parquet(
             str(staging_path / f"shard-{i:05d}-of-{num_shards:05d}.parquet")
         )
+
+    staging_path.mkdir(parents=True, exist_ok=True)
+    with ThreadPoolExecutor(max_workers=min(num_workers, num_shards)) as executor:
+        list(executor.map(_write_shard, range(num_shards)))
 
 
 def _load_staged_dataset(
@@ -127,7 +133,12 @@ def get_dataset_or_download_from_staging(
         logger.info(
             f"Storing the prepared dataset to {staging_path}. (#shards={num_shards})"
         )
-        _save_sharded_parquet(ds, num_shards=num_shards, staging_path=staging_path)
+        _save_sharded_parquet(
+            ds,
+            num_shards=num_shards,
+            staging_path=staging_path,
+            num_workers=preproc_args.num_proc,
+        )
         _write_metadata(staging_path, descriptor=task_descriptor, ds=ds)
 
     row_count = len(ds)
