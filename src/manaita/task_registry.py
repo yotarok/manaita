@@ -128,6 +128,11 @@ def _preprocess_dataset(
             )
             for ds in ret
         ]
+
+    if preproc_args.cleanup_cache_after_preprocess:
+        for ds in ret:
+            ds.cleanup_cache_files()
+
     return ret
 
 
