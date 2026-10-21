@@ -9,7 +9,6 @@ _PREPROCESSOR_SIGNATURES: dict[str, str] = {}
 
 
 def get_preprocessor(processordef: str | Mapping[str, Any]) -> PreProcessor:
-    # TODO: This has a significant overlap with get_eval_normalizer. Consider refactoring.
     if isinstance(processordef, str):
         ret = _PREPROCESSORS.get(processordef)
         if ret is None:

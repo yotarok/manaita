@@ -27,7 +27,7 @@ class PreProcessorArgs:
     filter_columns: Sequence[str] | None = None
     debug: bool = False
     multiprocess_start_method: str | None = "spawn"
-    cleanup_cache_after_preprocess: bool = False
+    cleanup_cache_after_staging: bool = False
 
     @property
     def descriptor(self) -> dict[str, Any]:
@@ -68,6 +68,16 @@ class PreProcessor(Protocol):
 
 class StagingOpts(TypedDict, total=False):
     num_shards: int
+
+
+class PreProcessorDef(TypedDict, extra_items=Any):
+    op: str
+    stage_outputs: NotRequired[bool]
+    signature: NotRequired[str]
+
+    @classmethod
+    def from_str(cls, s: str) -> "PreProcessorDef":
+        return {"op": s}
 
 
 class TrainingTaskDef(TypedDict):

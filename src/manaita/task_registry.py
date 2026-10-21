@@ -8,13 +8,18 @@ import datasets
 from loguru import logger
 import multiprocess
 
+from manaita.dataset import DatasetProcessor
 from manaita.dataset_uri import DatasetUri
 from manaita.preprocessor import get_preprocessor, get_preprocessor_signature
-from manaita.task_types import PreProcessorArgs, TaskDef, TaskLoader, TrainingTaskDef
+from manaita.task_types import (
+    PreProcessorArgs,
+    TaskDef,
+    TaskLoader,
+    TrainingTaskDef,
+    PreProcessorDef,
+)
 
 _TASK_LOADERS: tuple[TaskLoader, ...] = ()
-
-D = TypeVar("D", bound=datasets.Dataset | datasets.IterableDataset)
 
 
 @functools.cache
@@ -129,10 +134,6 @@ def _preprocess_dataset(
             for ds in ret
         ]
 
-    if preproc_args.cleanup_cache_after_preprocess:
-        for ds in ret:
-            ds.cleanup_cache_files()
-
     return ret
 
 
@@ -167,10 +168,10 @@ def get_task_descriptor(
 
     preprocessor_defs = []
     for ppdef in taskdef["preprocessors"]:
-        ppdef_dict: dict[str, Any] = (
-            {"op": ppdef} if isinstance(ppdef, str) else dict(ppdef)
+        ppdef: PreProcessorDef = PreProcessorDef.from_str(ppdef)
+            if isinstance(ppdef, str) PreProcessorDef(ppdef)
         )
-        op = ppdef_dict["op"]
+        op = ppdef["op"]
         if not isinstance(op, str):
             raise ValueError(f"preprocessor op must be a string: {ppdef}")
         ppdef_dict["signature"] = get_preprocessor_signature(op)
@@ -207,7 +208,6 @@ def get_dataset(
     preproc_args: PreProcessorArgs | None = None,
     *,
     training: bool = True,
-    shuffle: bool | None = None,
 ) -> datasets.Dataset:
     taskdef = get_taskdef(task_name)
     normalized_args = _normalize_preproc_args(preproc_args, training=training)
@@ -234,10 +234,6 @@ def get_dataset(
             multiprocess.set_start_method(previous_start_method)
 
     ret = _concatenate_datasets(processed)
-
-    should_shuffle = training if shuffle is None else shuffle
-    if should_shuffle:
-        ret = ret.shuffle()
 
     logger.info(f"Preparation of {task_name} finished.")
     return ret

@@ -141,6 +141,9 @@ def get_dataset_or_download_from_staging(
         )
         _write_metadata(staging_path, descriptor=task_descriptor, ds=ds)
 
+    if preproc_args.cleanup_cache_after_staging:
+        ds.cleanup_cache_files()
+
     row_count = len(ds)
     if streaming:
         return ds.to_iterable_dataset(num_shards=num_shards), row_count
