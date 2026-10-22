@@ -70,7 +70,7 @@ class StagingOpts(TypedDict, total=False):
     num_shards: int
 
 
-class PreProcessorDef(TypedDict, extra_items=Any):
+class PreProcessorDef(TypedDict):
     op: str
     stage_outputs: NotRequired[bool]
     signature: NotRequired[str]

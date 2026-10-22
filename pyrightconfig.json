@@ -1,0 +1,8 @@
+{
+  "venvPath": ".",
+  "venv": ".venv",
+  "reportExplicitAny": "none",
+  "reportMissingTypeStubs": "none",
+  "reportUnnecessaryIsInstance": "none",
+  "reportUnreachable": "none"
+}

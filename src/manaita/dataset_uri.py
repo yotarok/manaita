@@ -105,6 +105,9 @@ def load_dataset_from_hugging_face_hub(
 ) -> datasets.Dataset | datasets.IterableDataset:
     hf_user_name, hf_dataset_name, hf_config_name = (uri.name.split("/") + [None])[:3]
 
+    if streaming:
+        num_proc = None
+
     load_opts, _other_parameters = _extract_load_opts(dict(uri.parameters))
     logger.info(f"Loading dataset [{uri.name}:{uri.split}] from hfhub. ({load_opts=})")
     dataset = datasets.load_dataset(
@@ -126,6 +129,9 @@ def load_dataset_from_hugging_face_hub(
 def load_dataset_from_parquet_files(
     uri: DatasetUri, streaming: bool = False, num_proc: int | None = None
 ) -> datasets.Dataset | datasets.IterableDataset:
+    if streaming:
+        num_proc = None
+
     load_opts, _other_parameters = _extract_load_opts(dict(uri.parameters))
     logger.info(f"Loading dataset parquet glob {uri.name}. ({load_opts=})")
 

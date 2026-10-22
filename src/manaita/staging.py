@@ -8,17 +8,49 @@ import cloudpathlib
 import datasets
 from loguru import logger
 
-from manaita.task_registry import get_dataset, get_task_descriptor, get_taskdef
+from manaita.task_registry import (
+    get_dataset,
+    get_iterable_dataset,
+    get_task_descriptor,
+    get_taskdef,
+)
 from manaita.task_types import PreProcessorArgs, strhash
 
 
+def _generate_from_iterable_dataset(
+    ds: datasets.IterableDataset,
+    *,
+    num_workers: int,
+) -> datasets.Dataset:
+    num_shards = ds.num_shards
+
+    def gen(shard_ids):
+        for i in shard_ids:
+            logger.info(f"generating {i}-th shard (num_shards={num_shards})...")
+            yield from ds.shard(num_shards=num_shards, index=i)
+            logger.info(f"generating {i}-th shard (num_shards={num_shards}) completed.")
+
+    return cast(
+        datasets.Dataset,
+        datasets.Dataset.from_generator(
+            gen,
+            gen_kwargs={"shard_ids": list(range(num_shards))},
+            num_proc=min(num_shards, num_workers),
+            writer_batch_size=32,
+        ),
+    )
+
+
 def _save_sharded_parquet(
-    ds: datasets.Dataset,
+    ds: datasets.Dataset | datasets.IterableDataset,
     *,
     num_shards: int,
     staging_path: cloudpathlib.CloudPath,
     num_workers: int,
-) -> None:
+) -> datasets.Dataset:
+    if isinstance(ds, datasets.IterableDataset):
+        ds = _generate_from_iterable_dataset(ds, num_workers=num_workers)
+
     def _write_shard(i: int) -> None:
         shard = ds.shard(num_shards=num_shards, index=i)
         shard.to_parquet(
@@ -28,6 +60,8 @@ def _save_sharded_parquet(
     staging_path.mkdir(parents=True, exist_ok=True)
     with ThreadPoolExecutor(max_workers=min(num_workers, num_shards)) as executor:
         list(executor.map(_write_shard, range(num_shards)))
+
+    return ds
 
 
 def _load_staged_dataset(
@@ -93,11 +127,15 @@ def get_dataset_or_download_from_staging(
         preproc_args = PreProcessorArgs()
 
     if staging_prefix is None:
-        logger.info("Staging prefix is not given. Starting data preparation.")
-        ds = get_dataset(task, preproc_args, training=training)
-        row_count = len(ds)
+        logger.info(
+            f"Staging prefix is not given. Starting data preparation (streaming={streaming})."
+        )
         if streaming:
-            return ds.to_iterable_dataset(num_shards=num_shards), row_count
+            ds = get_iterable_dataset(task, preproc_args, training=training)
+            row_count = -1
+        else:
+            ds = get_dataset(task, preproc_args, training=training)
+            row_count = len(ds)
         return ds, row_count
 
     task_descriptor = json.dumps(
@@ -126,25 +164,35 @@ def get_dataset_or_download_from_staging(
             "On-demand data preparation is not allowed."
         )
 
-    logger.info("Prepared data is not found. Starting data preparation.")
-    ds = get_dataset(task, preproc_args, training=training)
+    logger.info(
+        f"Prepared data is not found. Starting data preparation. (streaming={streaming})"
+    )
+    if streaming:
+        ds = get_iterable_dataset(task, preproc_args, training=training)
+        row_count = -1
+    else:
+        ds = get_dataset(task, preproc_args, training=training)
+        row_count = len(ds)
 
     if stage_after_build:
         logger.info(
             f"Storing the prepared dataset to {staging_path}. (#shards={num_shards})"
         )
-        _save_sharded_parquet(
+        generated_ds = _save_sharded_parquet(
             ds,
             num_shards=num_shards,
             staging_path=staging_path,
             num_workers=preproc_args.num_proc,
         )
-        _write_metadata(staging_path, descriptor=task_descriptor, ds=ds)
+        _write_metadata(staging_path, descriptor=task_descriptor, ds=generated_ds)
+        if streaming:
+            ds = generated_ds.to_iterable_dataset(num_shards=num_shards)
 
     if preproc_args.cleanup_cache_after_staging:
         ds.cleanup_cache_files()
 
-    row_count = len(ds)
     if streaming:
-        return ds.to_iterable_dataset(num_shards=num_shards), row_count
-    return ds, row_count
+        return ds, -1
+    else:
+        row_count = len(ds)
+        return ds, row_count

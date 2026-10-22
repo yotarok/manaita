@@ -8,7 +8,7 @@ import datasets
 from loguru import logger
 import multiprocess
 
-from manaita.dataset import DatasetProcessor
+from manaita.dataset import DatasetProcessor, concatenate_dataset_processors
 from manaita.dataset_uri import DatasetUri
 from manaita.preprocessor import get_preprocessor, get_preprocessor_signature
 from manaita.task_types import (
@@ -57,18 +57,19 @@ def get_taskdef(task_name: str) -> TaskDef:
 
 
 def _apply_1d_length_filter(
-    ds: datasets.Dataset,
+    ds: DatasetProcessor,
     column: str,
     max_len: int,
     *,
     dim: int = 0,
     num_proc: int | None = None,
     desc: str | None = None,
-) -> datasets.Dataset:
-    if len(ds) == 0:
+) -> DatasetProcessor:
+    first_value = ds.peek_first()
+    if first_value is None:
         return ds
-    first_value = ds[0][column]
-    if isinstance(first_value, list):
+
+    if isinstance(first_value[column], list):
         return ds.filter(
             lambda x: len(x) <= max_len,
             input_columns=[column],
@@ -84,10 +85,10 @@ def _apply_1d_length_filter(
 
 
 def _preprocess_dataset(
-    subdatasets: Iterable[datasets.Dataset],
+    subdatasets: Iterable[DatasetProcessor],
     taskdef: TrainingTaskDef,
     preproc_args: PreProcessorArgs,
-) -> list[datasets.Dataset]:
+) -> list[DatasetProcessor]:
     if "preprocessor_args_override" in taskdef:
         preproc_args = dataclasses.replace(
             preproc_args, **taskdef["preprocessor_args_override"]
@@ -105,7 +106,7 @@ def _preprocess_dataset(
                 "label_ids",
                 max_len=preproc_args.max_label_tokens,
                 num_proc=preproc_args.num_proc,
-                desc=f"Filtering by length of 'label_ids' [{ds.info.dataset_name}]",
+                desc=f"Filtering by length of 'label_ids'",
             )
             for ds in ret
         ]
@@ -117,7 +118,7 @@ def _preprocess_dataset(
                 lambda x: x <= max_len,
                 input_columns=["input_value_length"],
                 num_proc=preproc_args.num_proc,
-                desc=f"Filtering by length of 'input_values' [{ds.info.dataset_name}]",
+                desc=f"Filtering by length of 'input_values'",
             )
             for ds in ret
         ]
@@ -168,14 +169,16 @@ def get_task_descriptor(
 
     preprocessor_defs = []
     for ppdef in taskdef["preprocessors"]:
-        ppdef: PreProcessorDef = PreProcessorDef.from_str(ppdef)
-            if isinstance(ppdef, str) PreProcessorDef(ppdef)
+        ppdef: PreProcessorDef = (
+            PreProcessorDef.from_str(ppdef)
+            if isinstance(ppdef, str)
+            else PreProcessorDef(ppdef)
         )
         op = ppdef["op"]
         if not isinstance(op, str):
             raise ValueError(f"preprocessor op must be a string: {ppdef}")
-        ppdef_dict["signature"] = get_preprocessor_signature(op)
-        preprocessor_defs.append(ppdef_dict)
+        ppdef["signature"] = get_preprocessor_signature(op)
+        preprocessor_defs.append(ppdef)
 
     return {
         "datasets": taskdef["datasets"],
@@ -195,12 +198,36 @@ def _load_dataset(
     )
 
 
-def _concatenate_datasets(dss: list[datasets.Dataset]) -> datasets.Dataset:
-    if len(dss) == 0:
-        raise ValueError("task definition must contain at least one dataset")
-    if len(dss) == 1:
-        return dss[0]
-    return datasets.concatenate_datasets(dss)
+def get_dataset_processor(
+    task_name: str,
+    preproc_args: PreProcessorArgs | None = None,
+    *,
+    streaming: bool,
+    training: bool = True,
+) -> DatasetProcessor:
+    taskdef = get_taskdef(task_name)
+    normalized_args = _normalize_preproc_args(preproc_args, training=training)
+
+    subdatasets = [
+        DatasetProcessor(
+            _load_dataset(dsuri, num_proc=normalized_args.num_proc, streaming=streaming)
+        )
+        for dsuri in taskdef["datasets"]
+    ]
+
+    previous_start_method = multiprocess.get_start_method(allow_none=True)
+    try:
+        if normalized_args.multiprocess_start_method:
+            multiprocess.set_start_method(normalized_args.multiprocess_start_method)
+        processed = _preprocess_dataset(subdatasets, taskdef, normalized_args)
+    finally:
+        if previous_start_method is not None:
+            multiprocess.set_start_method(previous_start_method)
+
+    ret = concatenate_dataset_processors(processed)
+
+    logger.info(f"Preparation of {task_name} finished.")
+    return ret
 
 
 def get_dataset(
@@ -209,34 +236,9 @@ def get_dataset(
     *,
     training: bool = True,
 ) -> datasets.Dataset:
-    taskdef = get_taskdef(task_name)
-    normalized_args = _normalize_preproc_args(preproc_args, training=training)
-
-    subdatasets = [
-        _load_dataset(dsuri, num_proc=normalized_args.num_proc)
-        for dsuri in taskdef["datasets"]
-    ]
-    map_style_subdatasets = [
-        ds for ds in subdatasets if isinstance(ds, datasets.Dataset)
-    ]
-    if len(map_style_subdatasets) != len(subdatasets):
-        raise TypeError(
-            "get_dataset only supports map-style datasets; use get_iterable_dataset"
-        )
-
-    previous_start_method = multiprocess.get_start_method(allow_none=True)
-    try:
-        if normalized_args.multiprocess_start_method:
-            multiprocess.set_start_method(normalized_args.multiprocess_start_method)
-        processed = _preprocess_dataset(map_style_subdatasets, taskdef, normalized_args)
-    finally:
-        if previous_start_method is not None:
-            multiprocess.set_start_method(previous_start_method)
-
-    ret = _concatenate_datasets(processed)
-
-    logger.info(f"Preparation of {task_name} finished.")
-    return ret
+    return get_dataset_processor(
+        task_name, preproc_args, streaming=False, training=training
+    ).as_dataset()
 
 
 def get_iterable_dataset(
@@ -244,7 +246,7 @@ def get_iterable_dataset(
     preproc_args: PreProcessorArgs | None = None,
     *,
     training: bool = True,
-    num_shards: int = 64,
 ) -> datasets.IterableDataset:
-    ds = get_dataset(task_name, preproc_args, training=training)
-    return ds.to_iterable_dataset(num_shards=num_shards)
+    return get_dataset_processor(
+        task_name, preproc_args, streaming=True, training=training
+    ).as_iterable_dataset()
