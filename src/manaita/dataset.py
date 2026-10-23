@@ -1,4 +1,5 @@
 import dataclasses
+from typing import Any
 
 import datasets
 from datasets import Dataset, IterableDataset
@@ -130,6 +131,10 @@ class DatasetProcessor:
             return list(first.keys())
         else:
             assert False, "should not reach here."
+
+    @property
+    def features(self):
+        return self.inner.features
 
 
 def concatenate_dataset_processors(dss: list[DatasetProcessor]) -> DatasetProcessor:
