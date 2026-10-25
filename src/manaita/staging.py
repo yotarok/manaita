@@ -1,8 +1,10 @@
 import json
 import pathlib
 import sys
+import threading
+from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, cast
+from typing import Any, cast, Callable
 
 import cloudpathlib
 import datasets
@@ -107,6 +109,22 @@ def _write_metadata(
     )
 
 
+def _without_lock(f: Callable[..., Any]) -> Callable[..., Any]:
+    return f
+
+
+lock = threading.Lock()
+
+
+def _with_global_lock(f: Callable[..., Any]) -> Callable[..., Any]:
+    def wrapped_f(*args, **kwargs):
+        with lock:
+            ret = f(*args, **kwargs)
+        return ret
+
+    return wrapped_f
+
+
 def get_dataset_or_download_from_staging(
     task: str,
     preproc_args: PreProcessorArgs | None = None,
@@ -116,12 +134,15 @@ def get_dataset_or_download_from_staging(
     streaming: bool = True,
     allow_build: bool = True,
     stage_after_build: bool = True,
+    forbid_parallel_build: bool = True,
 ) -> tuple[datasets.Dataset | datasets.IterableDataset, int]:
     taskdef = get_taskdef(task)
     staging_opts = taskdef.get("staging_opts", {})
     num_shards = staging_opts.get("num_shards", 20)
     if num_shards <= 0 or num_shards > 99_999:
         raise ValueError(f"{num_shards=} must be 0 < num_shards < 100000.")
+
+    maybe_with_lock = _with_global_lock if forbid_parallel_build else _without_lock
 
     if preproc_args is None:
         preproc_args = PreProcessorArgs()
@@ -131,10 +152,12 @@ def get_dataset_or_download_from_staging(
             f"Staging prefix is not given. Starting data preparation (streaming={streaming})."
         )
         if streaming:
+            # No staging + iterable does not need a critical section
             ds = get_iterable_dataset(task, preproc_args, training=training)
             row_count = -1
         else:
-            ds = get_dataset(task, preproc_args, training=training)
+            # No staging + non-iterable needs a critical section
+            ds = maybe_with_lock(get_dataset)(task, preproc_args, training=training)
             row_count = len(ds)
         return ds, row_count
 
@@ -168,10 +191,11 @@ def get_dataset_or_download_from_staging(
         f"Prepared data is not found. Starting data preparation. (streaming={streaming})"
     )
     if streaming:
+        # computation does not happen here, so no lock required
         ds = get_iterable_dataset(task, preproc_args, training=training)
         row_count = -1
     else:
-        ds = get_dataset(task, preproc_args, training=training)
+        ds = maybe_with_lock(get_dataset)(task, preproc_args, training=training)
         row_count = len(ds)
 
     if stage_after_build:
@@ -186,7 +210,9 @@ def get_dataset_or_download_from_staging(
         )
         _write_metadata(staging_path, descriptor=task_descriptor, ds=generated_ds)
         if streaming:
-            ds = generated_ds.to_iterable_dataset(num_shards=num_shards)
+            ds = maybe_with_lock(
+                lambda: generated_ds.to_iterable_dataset(num_shards=num_shards)
+            )()
 
     if preproc_args.cleanup_cache_after_staging:
         ds.cleanup_cache_files()
@@ -196,3 +222,38 @@ def get_dataset_or_download_from_staging(
     else:
         row_count = len(ds)
         return ds, row_count
+
+
+def get_multi_datasets_or_download_from_staging(
+    tasks: Iterable[str],
+    preproc_args: PreProcessorArgs | None = None,
+    *,
+    staging_prefix: str | None,
+    training: bool = True,
+    streaming: bool = True,
+    allow_build: bool = True,
+    stage_after_build: bool = True,
+) -> list[tuple[datasets.Dataset | datasets.IterableDataset, int]]:
+    if preproc_args is None:
+        preproc_args = PreProcessorArgs()
+
+    ret = []
+    logger.info("Resolving multiple datasets in parallel: {}", str(tasks))
+    with ThreadPoolExecutor(max_workers=preproc_args.num_proc) as executor:
+        futures = [
+            executor.submit(
+                get_dataset_or_download_from_staging,
+                task,
+                preproc_args,
+                staging_prefix=staging_prefix,
+                training=training,
+                streaming=streaming,
+                allow_build=allow_build,
+                stage_after_build=stage_after_build,
+                forbid_parallel_build=True,
+            )
+            for task in tasks
+        ]
+        for future in futures:
+            ret.append(future.result())
+    return ret
