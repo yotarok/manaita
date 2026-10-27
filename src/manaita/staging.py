@@ -8,6 +8,7 @@ from typing import Any, cast, Callable
 
 import cloudpathlib
 import datasets
+import pyarrow.dataset as pa_dataset
 from loguru import logger
 
 from manaita.task_registry import (
@@ -79,6 +80,15 @@ def _load_staged_dataset(
         split=datasets.Split.TRAIN,
         streaming=streaming,
         keep_in_memory=False,
+        batch_size=32,  # decoded rows per read batch
+        fragment_scan_options=pa_dataset.ParquetFragmentScanOptions(
+            pre_buffer=False,
+            use_buffered_stream=True,
+            buffer_size=64 * 1024,  # 64 KiB
+        ),
+        storage_options={
+            "cache_type": "none",
+        },
     )
     if not isinstance(ds, (datasets.Dataset, datasets.IterableDataset)):
         raise TypeError(f"unexpected staged dataset type: {type(ds)}")
@@ -135,7 +145,10 @@ def get_dataset_or_download_from_staging(
     allow_build: bool = True,
     stage_after_build: bool = True,
     forbid_parallel_build: bool = True,
-) -> tuple[datasets.Dataset | datasets.IterableDataset, int]:
+) -> datasets.Dataset | datasets.IterableDataset:
+    if not allow_build and staging_prefix is None:
+        raise ValueError("staging_prefix must be specified when allow_build==False")
+
     taskdef = get_taskdef(task)
     staging_opts = taskdef.get("staging_opts", {})
     num_shards = staging_opts.get("num_shards", 20)
@@ -159,7 +172,7 @@ def get_dataset_or_download_from_staging(
             # No staging + non-iterable needs a critical section
             ds = maybe_with_lock(get_dataset)(task, preproc_args, training=training)
             row_count = len(ds)
-        return ds, row_count
+        return ds
 
     task_descriptor = json.dumps(
         get_task_descriptor(task, preproc_args, training=training),
@@ -179,7 +192,7 @@ def get_dataset_or_download_from_staging(
             num_proc=preproc_args.num_proc,
         )
         row_count = int(info["num_example"]) if streaming else len(ds)
-        return ds, row_count
+        return ds
 
     if not allow_build:
         raise ValueError(
@@ -193,10 +206,8 @@ def get_dataset_or_download_from_staging(
     if streaming:
         # computation does not happen here, so no lock required
         ds = get_iterable_dataset(task, preproc_args, training=training)
-        row_count = -1
     else:
         ds = maybe_with_lock(get_dataset)(task, preproc_args, training=training)
-        row_count = len(ds)
 
     if stage_after_build:
         logger.info(
@@ -217,11 +228,7 @@ def get_dataset_or_download_from_staging(
     if preproc_args.cleanup_cache_after_staging:
         ds.cleanup_cache_files()
 
-    if streaming:
-        return ds, -1
-    else:
-        row_count = len(ds)
-        return ds, row_count
+    return ds
 
 
 def get_multi_datasets_or_download_from_staging(
@@ -233,7 +240,7 @@ def get_multi_datasets_or_download_from_staging(
     streaming: bool = True,
     allow_build: bool = True,
     stage_after_build: bool = True,
-) -> list[tuple[datasets.Dataset | datasets.IterableDataset, int]]:
+) -> list[datasets.Dataset | datasets.IterableDataset]:
     if preproc_args is None:
         preproc_args = PreProcessorArgs()
 
