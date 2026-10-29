@@ -7,6 +7,7 @@ from typing import Any, TypeVar
 import datasets
 from loguru import logger
 import multiprocess
+import numpy as np
 
 from manaita.dataset import DatasetProcessor, concatenate_dataset_processors
 from manaita.dataset_uri import DatasetUri
@@ -65,19 +66,8 @@ def _apply_1d_length_filter(
     num_proc: int | None = None,
     desc: str | None = None,
 ) -> DatasetProcessor:
-    first_value = ds.peek_first()
-    if first_value is None:
-        return ds
-
-    if isinstance(first_value[column], list):
-        return ds.filter(
-            lambda x: len(x) <= max_len,
-            input_columns=[column],
-            num_proc=num_proc,
-            desc=desc,
-        )
     return ds.filter(
-        lambda x: x.shape[dim] <= max_len,
+        lambda x: np.asarray(x).shape[dim] <= max_len,
         input_columns=[column],
         num_proc=num_proc,
         desc=desc,
@@ -124,16 +114,7 @@ def _preprocess_dataset(
         ]
 
     if preproc_args.filter_columns is not None:
-        ret = [
-            ds.remove_columns(
-                [
-                    name
-                    for name in ds.column_names
-                    if name not in preproc_args.filter_columns
-                ]
-            )
-            for ds in ret
-        ]
+        ret = [ds.select_columns(list(preproc_args.filter_columns)) for ds in ret]
 
     return ret
 
